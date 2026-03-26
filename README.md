@@ -1,3 +1,2 @@
-# httk-module
+# httk-web
 
-Description of the module
