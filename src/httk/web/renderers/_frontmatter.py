@@ -20,7 +20,25 @@ def split_front_matter(text: str) -> tuple[dict[str, Any], str]:
             if loaded is None:
                 return {}, body
             if isinstance(loaded, dict):
-                return loaded, body
+                # Normalize "*-list" keys (e.g. "menuitems-list") to match RstRenderer
+                # behavior: strip the "-list" suffix and ensure the value is a list.
+                normalized: dict[str, Any] = {}
+                for key, value in loaded.items():
+                    if isinstance(key, str) and key.endswith("-list"):
+                        base_key = key[:-5]
+                        existing = normalized.get(base_key)
+                        if existing is None:
+                            normalized[base_key] = []
+                        elif not isinstance(existing, list):
+                            normalized[base_key] = [existing]
+                        target_list = normalized[base_key]
+                        if isinstance(value, list):
+                            target_list.extend(value)
+                        elif value is not None:
+                            target_list.append(value)
+                    else:
+                        normalized[key] = value
+                return normalized, body
             return {}, body
 
     return {}, text

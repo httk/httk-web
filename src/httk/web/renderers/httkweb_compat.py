@@ -18,5 +18,12 @@ class HttkwebCompatRenderer:
     def render(self, source_path: Path) -> RenderResult:
         source = source_path.read_text(encoding="utf-8")
         metadata, body = split_front_matter(source)
-        html = publish_parts(body, writer=Writer()).get("html_body", "")
+        html = publish_parts(
+            body,
+            writer=Writer(),
+            settings_overrides={
+                "raw_enabled": False,
+                "file_insertion_enabled": False,
+            },
+        ).get("html_body", "")
         return RenderResult(html=html, metadata=dict(metadata))

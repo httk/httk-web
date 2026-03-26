@@ -7,16 +7,26 @@ from docutils.writers.html5_polyglot import Writer
 from .base import RenderResult
 
 
+_RST_SETTINGS_OVERRIDES = {
+    "raw_enabled": False,
+    "file_insertion_enabled": False,
+}
+
+
 class RstRenderer:
     def render(self, source_path: Path) -> RenderResult:
         source = source_path.read_text(encoding="utf-8")
 
-        html = publish_parts(source, writer=Writer()).get("html_body", "")
+        html = publish_parts(
+            source,
+            writer=Writer(),
+            settings_overrides=_RST_SETTINGS_OVERRIDES,
+        ).get("html_body", "")
         metadata = self._extract_metadata(source)
         return RenderResult(html=html, metadata=metadata)
 
     def _extract_metadata(self, source: str) -> dict[str, object]:
-        doctree = publish_doctree(source)
+        doctree = publish_doctree(source, settings_overrides=_RST_SETTINGS_OVERRIDES)
         metadata: dict[str, object] = {}
 
         for field in doctree.findall(nodes.field):

@@ -33,6 +33,7 @@ menuitems-list:
     assert page.status_code == 200
     assert "<h1>Hello</h1>" in page.body.decode("utf-8")
     assert page.metadata["title"] == "Test title"
+    assert page.metadata["menuitems"] == ["index", "about"]
 
 
 def test_rst_field_list_metadata(tmp_path: Path) -> None:
