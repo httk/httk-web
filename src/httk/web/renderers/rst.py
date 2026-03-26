@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from docutils import nodes
-from docutils.core import publish_doctree, publish_parts
+from docutils import io, nodes
+from docutils.core import publish_programmatically
 from docutils.writers.html5_polyglot import Writer
 
 from .base import RenderResult
@@ -17,16 +17,30 @@ class RstRenderer:
     def render(self, source_path: Path) -> RenderResult:
         source = source_path.read_text(encoding="utf-8")
 
-        html = publish_parts(
-            source,
+        _, pub = publish_programmatically(
+            source_class=io.StringInput,
+            source=source,
+            source_path=str(source_path),
+            destination_class=io.StringOutput,
+            destination=None,
+            destination_path=None,
+            reader=None,
+            reader_name="standalone",
+            parser=None,
+            parser_name="restructuredtext",
             writer=Writer(),
+            writer_name=None,
+            settings=None,
+            settings_spec=None,
             settings_overrides=_RST_SETTINGS_OVERRIDES,
-        ).get("html_body", "")
-        metadata = self._extract_metadata(source)
+            config_section=None,
+            enable_exit_status=False,
+        )
+        html = pub.writer.parts.get("html_body", "")
+        metadata = self._extract_metadata(pub.document)
         return RenderResult(html=html, metadata=metadata)
 
-    def _extract_metadata(self, source: str) -> dict[str, object]:
-        doctree = publish_doctree(source, settings_overrides=_RST_SETTINGS_OVERRIDES)
+    def _extract_metadata(self, doctree: nodes.document) -> dict[str, object]:
         metadata: dict[str, object] = {}
 
         for field in doctree.findall(nodes.field):
