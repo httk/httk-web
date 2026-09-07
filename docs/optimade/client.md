@@ -115,6 +115,56 @@ both bounds are nonnegative integers and the step is omitted or `1`; integer
 indexing, negative bounds, and non-unit steps are unsupported. Cursor rows are
 not implemented.
 
+## Includes and related resources
+
+`RemoteSearcher.include(*targets)` requests server-side `include=` for one or
+more related entry types (a `RemoteEntryType` or its transport name), so the
+response's `included` array carries those related resources alongside the
+primary page. Unlike `add_sort()` and `set_limit()`, `include()` returns
+`self` for chaining convenience; it is a builder outside the neutral portable
+protocol. An unknown name fails immediately, before any HTTP request.
+`include()` is ignored by `count()`'s own probe request.
+
+Depth-1 dotted relationship filters reach one related entry type by name --
+`variable.<related>.<field>` -- rendering as `<related>.<field>` in filter
+text, exactly as the server expects. This is filter-only and exactly one
+level deep: the resulting field cannot be chained further, and cannot be used
+as an output or a sort key. `<related>` must be a served entry type; if the
+root type happens to advertise its own property with that same name, the
+plain field wins. A dotted filter whose first segment is a served type but
+*not* a relationship of the queried endpoint is accepted by the server but
+returns zero rows, with an explanatory `meta.warnings` entry -- the client
+logs every `meta.warnings` entry (via `logging.getLogger(__name__).warning`)
+rather than silently dropping it.
+
+`OptimadeStore.related(obj, name)` resolves one JSON:API relationship of a
+resource already returned from a query -- *obj* is an
+`httk.core.optimade.OptimadeResource` or a typed backend (anything exposing
+`unwrap() -> OptimadeResource`), and *name* is a relationship block key.
+Identifiers are matched against the response's `included` array by their own
+`(type, id)`, never by the block key: some relationships (StrongLink
+provenance edges) use wire keys that differ from the identifier's `type`. A
+related resource already present in `included` -- see `include()` above -- is
+wrapped in place (with its own entry type's backend) at no extra cost; one
+absent from `included` costs one HTTP request per missing identifier.
+
+```python
+from httk.serve.optimade import OptimadeStore
+
+with OptimadeStore("https://example.org/optimade") as store:
+    materials = store.entry_type("materials")
+    search = store.searcher().include("structures")
+    material = search.variable(materials)
+    search.add(material.structures.nelements > 2)
+    row = search.results(item=material).one()
+
+    (structure,) = store.related(row.item, "structures")
+    print(structure.id, structure.chemical_formula_reduced)
+```
+
+`FederatedStore` does not expose `include()` or `related()`; call them on the
+originating `OptimadeStore` directly.
+
 ## Federating endpoints
 
 `FederatedStore` (from *httk-store*) combines already-open stores into one
@@ -219,6 +269,12 @@ sid = cache.save(backend)
 offline = cache.fetch(type(backend), sid)
 raw_resource = offline.unwrap()
 ```
+
+`OptimadeResource` carries a `member` field (`"data"` for a primary resource,
+`"included"` for one addressed from `related()`) that participates in its
+identity, so an offline cache created before that field existed uses an
+incompatible storage layout and must be recreated; the store rejects the
+old layout explicitly rather than silently reinterpreting it.
 
 This reconstructs the same typed backend class and its exact raw resource.
 `SqlStore.save()` deduplicates shared whole-page documents and schema snapshots

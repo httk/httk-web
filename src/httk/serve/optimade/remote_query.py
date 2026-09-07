@@ -18,13 +18,14 @@ attribute" instead of surfacing as a backend failure.
 
 import datetime
 import json
+import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Self, cast
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 from httk.core import load_entry_type_definition
@@ -390,7 +391,7 @@ class _RemoteVariable:
     def always_false(self) -> _RemoteExpression:
         return self._searcher._constant(False)
 
-    def __getattr__(self, name: str) -> _RemoteField:
+    def __getattr__(self, name: str) -> "_RemoteField | _RemoteRelated":
         if name.startswith("__"):
             # Dunder probes (``__deepcopy__``, ``__iter__``, ...) never name a
             # field, so reject them before the field map is even consulted.
@@ -398,6 +399,13 @@ class _RemoteVariable:
         try:
             return self._fields[name]
         except KeyError:
+            related = self._searcher._store.entry_types_by_name.get(name)
+            if related is not None:
+                # A name shadowing a discovered entry type (checked before
+                # the underscore fallback below, so a served type whose own
+                # name is provider-prefixed, e.g. ``_httk_records``, still
+                # resolves) opens depth-1 relationship traversal for filters.
+                return _RemoteRelated(self._searcher, name, related)
             if name.startswith("_"):
                 # A single leading underscore is the OPTIMADE provider-prefix
                 # shape (``_<prefix>_<property>``) as well as the shape used
@@ -409,6 +417,52 @@ class _RemoteVariable:
             descriptor = self._searcher._descriptor
             endpoint = descriptor.name if descriptor is not None else "(unbound)"
             raise _unsupported(f"field {name!r} for endpoint {endpoint!r}") from None
+
+
+class _RemoteRelated:
+    """A depth-1, filter-only relationship namespace bound to a related entry type.
+
+    Returned when attribute access on a bound query variable names a
+    discovered entry type rather than a declared field of the root type
+    (``material.structures`` where ``structures`` is a served endpoint).
+    Attribute access on this namespace resolves against the related type's
+    own field map and renders as ``<related endpoint>.<field>`` in filter
+    text; the resulting :class:`_RemoteField` cannot be chained further,
+    used as an output, or used as a sort key -- OPTIMADE relationship
+    traversal in filters is filter-only and one level deep.
+    """
+
+    __slots__ = ("_descriptor", "_name", "_searcher", "_specs")
+
+    def __init__(self, searcher: "RemoteSearcher", name: str, descriptor: RemoteEntryType) -> None:
+        self._searcher = searcher
+        self._name = name
+        self._descriptor = descriptor
+        # Computed once here rather than per attribute access: same specs
+        # _bind_descriptor uses for the root variable's own field map.
+        self._specs = RemoteSearcher._field_specs(descriptor)
+
+    def __getattr__(self, name: str) -> _RemoteField:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        spec = self._specs.get(name)
+        if spec is None:
+            if name.startswith("_"):
+                # Same provider-prefix/introspection-probe safety net as
+                # _RemoteVariable.__getattr__, applied to the related type's
+                # own field map.
+                raise AttributeError(name) from None
+            raise _unsupported(f"field {name!r} for related type {self._name!r}")
+        definition_id, remote_name, kind, item_kind, capabilities = spec
+        return _RemoteField(
+            self._searcher,
+            f"{self._name}.{name}",
+            definition_id,
+            f"{self._descriptor.name}.{remote_name}",
+            kind,
+            item_kind,
+            capabilities,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +492,7 @@ class RemoteSearcher:
         self._limit: int | None = None
         self.offset = 0
         self._count_cache = _CountCache()
+        self._includes: tuple[str, ...] = ()
 
     def _clone(self) -> "RemoteSearcher":
         clone = type(self)(self._store, response_fields=self._response_fields_setting)
@@ -457,6 +512,7 @@ class RemoteSearcher:
         clone._limit = self._limit
         clone.offset = self.offset
         clone._count_cache = self._count_cache
+        clone._includes = self._includes
         return clone
 
     def _invalidate_count(self) -> None:
@@ -568,9 +624,24 @@ class RemoteSearcher:
                 selected.append(remote_name)
         return tuple(selected)
 
-    def _bind_descriptor(self, descriptor: RemoteEntryType) -> _RemoteVariable:
-        query_fields, all_fields, kinds, capabilities = self._typed_maps(descriptor)
-        fields: dict[str, _RemoteField] = {}
+    @staticmethod
+    def _field_specs(
+        descriptor: RemoteEntryType,
+    ) -> dict[str, tuple[str, str, str, str | None, PortableQueryCapabilities | None]]:
+        """Return one ``(definition_id, remote_name, kind, item_kind, capabilities)``
+        spec per query-supported field, keyed by local name -- the exact
+        ingredients :class:`_RemoteField` needs.
+
+        Shared by :meth:`_bind_descriptor` (building a root query variable)
+        and :class:`_RemoteRelated` (building depth-1 relationship fields),
+        so definition-IRI derivation for a generic vs. a bound descriptor is
+        written, and computed, exactly once for both call sites.
+
+        :param descriptor: Entry type to derive field specs for.
+        :return: Field specs keyed by local name.
+        """
+
+        query_fields, _all_fields, kinds, capabilities = RemoteSearcher._typed_maps(descriptor)
         if descriptor.binding is None:
             definition_ids = {
                 name: descriptor.property_iris.get(name, name)
@@ -581,15 +652,17 @@ class RemoteSearcher:
         else:
             schema = load_entry_type_definition(descriptor.binding.definition_id)
             definition_ids = {name: definition.definition_id for name, definition in schema.properties.items()}
-        for local_name, remote_name in query_fields.items():
-            fields[local_name] = _RemoteField(
-                self,
-                local_name,
-                definition_ids[local_name],
-                remote_name,
-                *kinds[local_name],
-                capabilities.get(local_name),
-            )
+        return {
+            local_name: (definition_ids[local_name], remote_name, *kinds[local_name], capabilities.get(local_name))
+            for local_name, remote_name in query_fields.items()
+        }
+
+    def _bind_descriptor(self, descriptor: RemoteEntryType) -> _RemoteVariable:
+        _query_fields, all_fields, _kinds, _capabilities = self._typed_maps(descriptor)
+        fields = {
+            local_name: _RemoteField(self, local_name, *spec)
+            for local_name, spec in self._field_specs(descriptor).items()
+        }
         self._descriptor = descriptor
         self._fields = MappingProxyType(fields)
         self._response_transport_fields = self._select_response_fields(descriptor, all_fields)
@@ -651,6 +724,10 @@ class RemoteSearcher:
         if variable is root:
             output = _Output(name, root, None)
         elif isinstance(variable, _RemoteField) and variable._searcher is self:
+            if self._fields.get(variable._local_name) is not variable:
+                # A related field (_RemoteRelated.__getattr__) is never a
+                # value of this searcher's own field map -- it is filter-only.
+                raise _unsupported("related fields as outputs or sort keys")
             output = _Output(name, None, variable)
         else:
             raise _unsupported("outputs other than the root record or a portable scalar field")
@@ -720,6 +797,8 @@ class RemoteSearcher:
         descriptor, _variable = self._require_variable()
         if not isinstance(field, _RemoteField) or field._searcher is not self:
             raise _unsupported("sort keys from another backend or searcher")
+        if self._fields.get(field._local_name) is not field:
+            raise _unsupported("related fields as outputs or sort keys")
         if not isinstance(descending, bool):
             raise TypeError("descending must be a bool")
         if field._remote_name not in descriptor.sortable_properties:
@@ -746,6 +825,34 @@ class RemoteSearcher:
             raise ValueError("offset must be nonnegative")
         self.offset += offset
 
+    def include(self, *targets: object) -> Self:
+        """Request related resources via the OPTIMADE ``include`` query parameter.
+
+        Unlike :meth:`add_sort` and :meth:`set_limit`, this returns ``self``
+        rather than ``None``: it is a builder convenience for chaining, not
+        part of the neutral portable-query protocol.
+
+        :param \\*targets: One or more discovered entry types, or their transport endpoint names.
+        :return: This searcher, for chaining.
+        :raises TypeError: If no target is given.
+        :raises httk.store.UnsupportedQueryError: If a name does not match a discovered endpoint.
+        """
+        if not targets:
+            raise TypeError("include() requires at least one target")
+        names: list[str] = []
+        for target in targets:
+            if isinstance(target, RemoteEntryType):
+                name = target.name
+            elif isinstance(target, str):
+                name = target
+            else:
+                raise _unsupported("include targets other than a RemoteEntryType or entry-type name")
+            if name not in self._store.entry_types_by_name:
+                raise _unsupported(f"include of unknown entry type {name!r}")
+            names.append(name)
+        self._includes = tuple(dict.fromkeys((*self._includes, *names)))
+        return self
+
     def _filter_text(self) -> str | None:
         if not self._expressions:
             return None
@@ -756,6 +863,7 @@ class RemoteSearcher:
         *,
         page_limit: int,
         include_sort: bool = True,
+        include_related: bool = True,
         response_fields: tuple[str, ...] | None | object = ...,
     ) -> str:
         descriptor, _variable = self._require_variable()
@@ -773,6 +881,8 @@ class RemoteSearcher:
                     ",".join(("-" if descending else "") + field._remote_name for field, descending in self._sorts),
                 )
             )
+        if include_related and self._includes:
+            parameters.append(("include", ",".join(self._includes)))
         parameters.append(("page_limit", str(page_limit)))
         return self._store._transport_base_url + "/" + quote(descriptor.name, safe="") + "?" + urlencode(parameters)
 
@@ -862,27 +972,93 @@ class RemoteSearcher:
                 f"OPTIMADE response from {_safe_source(source_url)!r} has non-boolean meta.more_data_available"
             )
 
-        resources: list[Mapping[str, object]] = []
-        for data_index, item in enumerate(raw_data):
-            if not isinstance(item, dict):
-                raise OptimadeResponseError(f"OPTIMADE response data[{data_index}] must be an object")
-            for envelope_member in ("id", "type"):
-                envelope_value = item.get(envelope_member)
-                if not isinstance(envelope_value, str) or not envelope_value:
-                    raise OptimadeResponseError(
-                        f"OPTIMADE response data[{data_index}].{envelope_member} must be a nonempty string"
-                    )
-            if item["type"] != endpoint:
+        return [
+            RemoteSearcher._validate_resource_item(item, data_index, member="data", endpoint=endpoint)
+            for data_index, item in enumerate(raw_data)
+        ]
+
+    @staticmethod
+    def _validate_resource_item(
+        item: object,
+        index: int,
+        *,
+        member: str,
+        endpoint: str | None = None,
+    ) -> Mapping[str, object]:
+        """Validate one JSON:API resource object from a response envelope array.
+
+        Shared by primary ``data`` page validation (``_validate_entry_page``)
+        and included-member validation (``OptimadeStore.related``): both
+        apply the identical envelope-shape checks -- an object with nonempty
+        string ``id``/``type`` and object-valued ``attributes``/``relationships``
+        when present -- differing only in whether ``type`` must match one known
+        endpoint.
+
+        :param item: Candidate resource object.
+        :param index: Index within the ``member`` array, for diagnostics.
+        :param member: Envelope member name, for diagnostics (``"data"`` or ``"included"``).
+        :param endpoint: Required resource ``type``, or ``None`` to accept any type.
+        :return: The validated resource object.
+        :raises OptimadeResponseError: If the resource object is malformed.
+        """
+
+        # Mapping, not dict: primary-page items come from plain json.loads()
+        # dicts, but included-member items (OptimadeStore.related()) come
+        # from the frozen, already-redacted document root, whose objects are
+        # immutable MappingProxyType instances rather than dicts.
+        if not isinstance(item, Mapping):
+            raise OptimadeResponseError(f"OPTIMADE response {member}[{index}] must be an object")
+        for envelope_member in ("id", "type"):
+            envelope_value = item.get(envelope_member)
+            if not isinstance(envelope_value, str) or not envelope_value:
                 raise OptimadeResponseError(
-                    f"OPTIMADE response data[{data_index}].type does not match queried endpoint {endpoint!r}"
+                    f"OPTIMADE response {member}[{index}].{envelope_member} must be a nonempty string"
                 )
-            for member in ("attributes", "relationships"):
-                if member in item and not isinstance(item[member], dict):
-                    raise OptimadeResponseError(
-                        f"OPTIMADE response data[{data_index}].{member} must be an object when present"
-                    )
-            resources.append(item)
-        return resources
+        if endpoint is not None and item["type"] != endpoint:
+            raise OptimadeResponseError(
+                f"OPTIMADE response {member}[{index}].type does not match queried endpoint {endpoint!r}"
+            )
+        for sub_member in ("attributes", "relationships"):
+            if sub_member in item and not isinstance(item[sub_member], Mapping):
+                raise OptimadeResponseError(
+                    f"OPTIMADE response {member}[{index}].{sub_member} must be an object when present"
+                )
+        return item
+
+    @staticmethod
+    def _wrap(descriptor: RemoteEntryType, resource: OptimadeResource) -> object:
+        """Wrap one resource with its entry type's backend, unless the type is generic.
+
+        :param descriptor: Entry type descriptor owning the wrapping backend.
+        :param resource: Resource to wrap.
+        :return: The bound backend instance, or *resource* itself for a generic (unbound) entry type.
+        """
+
+        if descriptor.backend is OptimadeResource:
+            return resource
+        return cast(Callable[[OptimadeResource], object], descriptor.backend)(resource)
+
+    @staticmethod
+    def _log_page_warnings(root: Mapping[str, object]) -> None:
+        """Log every ``meta.warnings`` entry of one validated response page.
+
+        A dotted filter whose first segment is a served type but not a
+        relationship of the queried endpoint returns HTTP 200 with zero rows
+        and only a ``meta.warnings`` entry to explain why -- this is the
+        client's only surface for that condition, so it is logged rather than
+        silently dropped.
+        """
+
+        meta = root.get("meta")
+        if not isinstance(meta, dict):
+            return
+        warnings = meta.get("warnings")
+        if not isinstance(warnings, list) or not warnings:
+            return
+        logger = logging.getLogger(__name__)
+        for warning in warnings:
+            detail = warning.get("detail") if isinstance(warning, Mapping) else None
+            logger.warning(detail if isinstance(detail, str) else json.dumps(warning), extra={"context": "optimade"})
 
     def _objects(
         self,
@@ -928,6 +1104,7 @@ class RemoteSearcher:
                 # redacted document below is retained by yielded resources.
                 raw_root = self._raw_root(raw_text, next_url)
                 raw_data = self._validate_entry_page(raw_root, next_url, descriptor.name)
+                self._log_page_warnings(raw_root)
                 document = OptimadeDocument.from_response(raw_text, next_url)
                 safe_root = optimade_document_root(document)
                 safe_data = safe_root.get("data")
@@ -938,12 +1115,7 @@ class RemoteSearcher:
                         skipped += 1
                         continue
                     resource = OptimadeResource(document, data_index, descriptor.schema)
-                    value = (
-                        resource
-                        if descriptor.backend is OptimadeResource
-                        else cast(Callable[[OptimadeResource], object], descriptor.backend)(resource)
-                    )
-                    yield value, resource
+                    yield self._wrap(descriptor, resource), resource
                     emitted += 1
                     if effective_limit is not None and emitted >= effective_limit:
                         return
@@ -990,6 +1162,7 @@ class RemoteSearcher:
         url = self._request_url(
             page_limit=1,
             include_sort=False,
+            include_related=False,
             response_fields=(self._fields["id"]._remote_name,) if "id" in self._fields else None,
         )
         raw_text = self._store._get(url)
@@ -1073,6 +1246,8 @@ class RemoteResultSet:
                 if value is searcher._variable:
                     self._plan.output(self._plan._variable, name)
                 elif isinstance(value, _RemoteField) and value._searcher is searcher:
+                    if searcher._fields.get(value._local_name) is not value:
+                        raise _unsupported("related fields as outputs or sort keys")
                     self._plan.output(self._plan._fields[value._local_name], name)
                 else:
                     raise _unsupported("result projections from another backend or searcher")

@@ -20,6 +20,7 @@ from httk.core.optimade import (
     OptimadeDocument,
     OptimadeResource,
     OptimadeSchemaSnapshot,
+    optimade_document_root,
     redact_optimade_url,
 )
 from httk.core.register import (
@@ -27,6 +28,7 @@ from httk.core.register import (
     known_optimade_entry_bindings,
     optimade_entry_binding,
 )
+from httk.store import NoResultError
 
 if TYPE_CHECKING:
     from httk.store.query.slicer import Slicer
@@ -723,6 +725,107 @@ class OptimadeStore:
 
         selected = self.response_fields if response_fields is ... else response_fields
         return RemoteSearcher(self, response_fields=selected)
+
+    def related(self, obj: object, name: str) -> tuple[object, ...]:
+        """Resolve one JSON:API relationship of a previously fetched resource.
+
+        Identifiers are matched against the response's ``included`` array by
+        ``(type, id)``, never by the relationship block key *name* itself:
+        some relationships (StrongLink provenance edges) use wire keys that
+        differ from the identifier's own ``type``. A related resource
+        already present in ``included`` -- see ``RemoteSearcher.include()``
+        -- is wrapped in place at no extra cost; one absent from ``included``
+        costs one HTTP request per missing identifier. ``FederatedStore``
+        does not expose this method or ``include()``; call them on the
+        origin store instead.
+
+        :param obj: An :class:`~httk.core.optimade.OptimadeResource`, or an object exposing ``unwrap() -> OptimadeResource`` such as a typed backend.
+        :param name: Relationship block key, as declared by the resource's ``relationships`` member.
+        :return: Related objects in relationship order, each wrapped with its own entry type's backend.
+        :raises TypeError: If *obj* is not an ``OptimadeResource`` and has no usable ``unwrap()``.
+        :raises OptimadeClientError: If the relationship, an identifier's entry type, or an identifier is unresolvable.
+        :raises OptimadeResponseError: If ``included`` or a matched member is malformed.
+        :raises httk.store.MultipleResultsError: If a lazy fetch by ``id`` matches more than one resource.
+        """
+
+        from .remote_query import OptimadeResponseError, RemoteSearcher
+
+        resource: OptimadeResource
+        if isinstance(obj, OptimadeResource):
+            resource = obj
+        else:
+            unwrap = getattr(obj, "unwrap", None)
+            candidate = unwrap() if callable(unwrap) else None
+            if not isinstance(candidate, OptimadeResource):
+                raise TypeError(
+                    "related() requires an OptimadeResource or an object exposing unwrap() -> OptimadeResource"
+                )
+            resource = candidate
+
+        relationships = resource.get("relationships")
+        if not isinstance(relationships, Mapping) or name not in relationships:
+            available = sorted(relationships) if isinstance(relationships, Mapping) else []
+            raise OptimadeClientError(
+                f"resource {resource.id!r} of type {resource.type!r} has no relationship {name!r}; "
+                f"available relationships: {available}"
+            )
+        block = relationships[name]
+        data_raw = block.get("data") if isinstance(block, Mapping) else None
+        if not data_raw:
+            return ()
+        if not isinstance(data_raw, tuple):
+            raise OptimadeResponseError(f"relationship {name!r} data must be an array")
+        data = data_raw
+
+        included_raw = optimade_document_root(resource.document).get("included")
+        if included_raw is None:
+            included: tuple[object, ...] = ()
+        elif isinstance(included_raw, tuple):
+            included = included_raw
+        else:
+            raise OptimadeResponseError("OPTIMADE document 'included' must be an array when present")
+        validated_included = [
+            RemoteSearcher._validate_resource_item(item, index, member="included")
+            for index, item in enumerate(included)
+        ]
+
+        results: list[object] = []
+        for identifier in data:
+            if not isinstance(identifier, Mapping):
+                raise OptimadeResponseError(f"relationship {name!r} identifier must be an object")
+            id_type = identifier.get("type")
+            id_value = identifier.get("id")
+            if not isinstance(id_type, str) or not id_type or not isinstance(id_value, str) or not id_value:
+                raise OptimadeResponseError(
+                    f"relationship {name!r} identifier must have nonempty string 'type' and 'id'"
+                )
+            descriptor = self._entry_types_by_name.get(id_type)
+            if descriptor is None:
+                raise OptimadeClientError(f"relationship {name!r} identifier names unknown entry type {id_type!r}")
+            match_index = next(
+                (
+                    index
+                    for index, item in enumerate(validated_included)
+                    if item["type"] == id_type and item["id"] == id_value
+                ),
+                None,
+            )
+            if match_index is not None:
+                included_resource = OptimadeResource(
+                    resource.document, match_index, descriptor.schema, member="included"
+                )
+                results.append(RemoteSearcher._wrap(descriptor, included_resource))
+                continue
+            # Not included: one lazy fetch per missing identifier.
+            search = self.searcher()
+            variable = search.variable(descriptor)
+            search.add(variable.id == id_value)
+            try:
+                row = search.results(item=variable).one()
+            except NoResultError as exc:
+                raise OptimadeClientError(f"related {id_type!r} identifier {id_value!r} was not found") from exc
+            results.append(row.item)
+        return tuple(results)
 
     def slicer(self, target: "RemoteEntryType | str") -> "Slicer":
         """A pandas-style ``[]`` indexing view over one discovered entry endpoint.
