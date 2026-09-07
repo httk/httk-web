@@ -16,7 +16,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 import pytest
-from httk.atomistic import Species, StructureEntryProvider, UnitcellStructure
+from httk.atomistic import OptimadeStructure, Species, StructureEntryProvider, UnitcellStructure
 from httk.core import (
     EntryProvider,
     EntryTypeDefinition,
@@ -270,7 +270,10 @@ def test_same_portable_structure_query_across_memory_sql_and_real_asgi_remote(di
     memory = InMemoryStore({"structures": memory_rows})
 
     remote_backends = _all_remote_backends(remote)
-    assert all(type(backend).__name__ == "OptimadeStructure" for backend in remote_backends)
+    # A remote result is a thin bound subclass carrying a .links accessor
+    # (see remote_query._bound_class), never the plain OptimadeStructure
+    # class itself, though isinstance and equality against it still hold.
+    assert all(isinstance(backend, OptimadeStructure) for backend in remote_backends)
 
     with _database(dialect) as database:
         sql = SqlStore(database, entry_records={})
@@ -351,7 +354,11 @@ def test_remote_typed_and_generic_resources_copy_to_sqlite_without_losing_source
         typed = store.fetch(type(nacl), typed_sid, eager=True)
         generic = store.fetch(OptimadeResource, generic_sid)
 
-        assert type(typed) is type(nacl)
+        # nacl's own type is a thin bound-with-.links subclass (see
+        # remote_query._bound_class); an eager fetch always reconstructs the
+        # plain storage class, never that subclass, though they compare equal.
+        assert type(typed) is OptimadeStructure
+        assert typed == nacl
         assert typed.resource.document == nacl.resource.document
         assert typed.resource.schema == nacl.resource.schema
         assert typed.elements_ratios == nacl.elements_ratios

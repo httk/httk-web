@@ -16,7 +16,9 @@ keeps probes shaped like a provider field but not one, such as IPython's
 attribute" instead of surfacing as a backend failure.
 """
 
+import dataclasses
 import datetime
+import functools
 import json
 import logging
 import math
@@ -25,7 +27,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 from httk.core import load_entry_type_definition
@@ -391,21 +393,20 @@ class _RemoteVariable:
     def always_false(self) -> _RemoteExpression:
         return self._searcher._constant(False)
 
-    def __getattr__(self, name: str) -> "_RemoteField | _RemoteRelated":
+    def __getattr__(self, name: str) -> "_RemoteField | _RemoteLinks":
         if name.startswith("__"):
             # Dunder probes (``__deepcopy__``, ``__iter__``, ...) never name a
             # field, so reject them before the field map is even consulted.
             raise AttributeError(name)
+        if name == "links":
+            # Checked before the field map: ``links`` is a JSON:API-reserved
+            # member, so even a generic endpoint that happens to advertise a
+            # same-named property must still yield the relationship
+            # namespace, never that property.
+            return _RemoteLinks(self._searcher, self)
         try:
             return self._fields[name]
         except KeyError:
-            related = self._searcher._store.entry_types_by_name.get(name)
-            if related is not None:
-                # A name shadowing a discovered entry type (checked before
-                # the underscore fallback below, so a served type whose own
-                # name is provider-prefixed, e.g. ``_httk_records``, still
-                # resolves) opens depth-1 relationship traversal for filters.
-                return _RemoteRelated(self._searcher, name, related)
             if name.startswith("_"):
                 # A single leading underscore is the OPTIMADE provider-prefix
                 # shape (``_<prefix>_<property>``) as well as the shape used
@@ -419,39 +420,83 @@ class _RemoteVariable:
             raise _unsupported(f"field {name!r} for endpoint {endpoint!r}") from None
 
 
-class _RemoteRelated:
-    """A depth-1, filter-only relationship namespace bound to a related entry type.
+class _RemoteLinks:
+    """The ``links`` relationship namespace bound to a root query variable.
 
-    Returned when attribute access on a bound query variable names a
-    discovered entry type rather than a declared field of the root type
-    (``material.structures`` where ``structures`` is a served endpoint).
-    Attribute access on this namespace resolves against the related type's
-    own field map and renders as ``<related endpoint>.<field>`` in filter
-    text; the resulting :class:`_RemoteField` cannot be chained further,
-    used as an output, or used as a sort key -- OPTIMADE relationship
-    traversal in filters is filter-only and one level deep.
+    Returned for ``variable.links``. Attribute access names one relationship
+    of the queried resource -- a served entry type (``material.links.structures``)
+    or a wire-only relationship key such as a StrongLink provenance edge
+    (``run.links._httk_has_input``) -- and never rejects the name up front:
+    the actual relationship set of a resource is only known from a response,
+    so an unresolvable name surfaces as :class:`~httk.serve.optimade.client.OptimadeClientError`
+    at resolution time (a predicate, output, or ``.links.<name>`` access),
+    listing the resource's real relationships.
     """
 
-    __slots__ = ("_descriptor", "_name", "_searcher", "_specs")
+    __slots__ = ("_searcher", "_variable")
 
-    def __init__(self, searcher: "RemoteSearcher", name: str, descriptor: RemoteEntryType) -> None:
+    def __init__(self, searcher: "RemoteSearcher", variable: _RemoteVariable) -> None:
         self._searcher = searcher
+        self._variable = variable
+
+    def __getattr__(self, name: str) -> "_RemoteLinkSet":
+        if name.startswith("__"):
+            raise AttributeError(name)
+        descriptor = self._searcher._store.entry_types_by_name.get(name)
+        return _RemoteLinkSet(self._searcher, self._variable, name, descriptor)
+
+
+class _RemoteLinkSet:
+    """A depth-1 relationship namespace bound to one named relationship.
+
+    Usable as a predicate root (field chaining renders ``<name>.<field>`` in
+    filter text, one level deep and filter-only) and as a set-valued output
+    or ``results()`` projection, which requests server-side ``include=`` for
+    a served relationship's *name* and yields a tuple of bound related
+    records per row. Field chaining is unavailable for a relationship whose
+    name is not itself a served entry type (a wire-only key): its members can
+    still be projected as an output, just not traversed further in a filter.
+
+    :param searcher: Owning search plan.
+    :param variable: Root query variable this relationship namespace belongs to.
+    :param name: Relationship name.
+    :param descriptor: The related entry type, or ``None`` for a wire-only relationship key.
+    """
+
+    __slots__ = ("_descriptor", "_name", "_searcher", "_specs", "_variable")
+
+    def __init__(
+        self,
+        searcher: "RemoteSearcher",
+        variable: _RemoteVariable,
+        name: str,
+        descriptor: RemoteEntryType | None,
+    ) -> None:
+        self._searcher = searcher
+        self._variable = variable
         self._name = name
         self._descriptor = descriptor
         # Computed once here rather than per attribute access: same specs
-        # _bind_descriptor uses for the root variable's own field map.
-        self._specs = RemoteSearcher._field_specs(descriptor)
+        # _bind_descriptor uses for the root variable's own field map. Empty
+        # (never None) for a wire-only relationship key, so a probe below
+        # needs no descriptor-is-None special case.
+        self._specs = {} if descriptor is None else RemoteSearcher._field_specs(descriptor)
 
     def __getattr__(self, name: str) -> _RemoteField:
         if name.startswith("__"):
             raise AttributeError(name)
+        if name.startswith("_") and name not in self._specs:
+            # Same provider-prefix/introspection-probe safety net as
+            # _RemoteVariable.__getattr__, applied to the related type's own
+            # field map -- checked before the not-a-served-entry-type
+            # rejection below, so an introspection probe (e.g. IPython's
+            # canary) gets a plain AttributeError on a wire-only relationship
+            # key too, not the descriptive error.
+            raise AttributeError(name) from None
+        if self._descriptor is None:
+            raise _unsupported(f"field chaining on relationship {self._name!r}: it is not a served entry type")
         spec = self._specs.get(name)
         if spec is None:
-            if name.startswith("_"):
-                # Same provider-prefix/introspection-probe safety net as
-                # _RemoteVariable.__getattr__, applied to the related type's
-                # own field map.
-                raise AttributeError(name) from None
             raise _unsupported(f"field {name!r} for related type {self._name!r}")
         definition_id, remote_name, kind, item_kind, capabilities = spec
         return _RemoteField(
@@ -470,6 +515,210 @@ class _Output:
     name: str
     variable: _RemoteVariable | None
     field: _RemoteField | None
+    link: str | None = None
+
+
+_BOUND_STORE = "_httk_bound_store"
+_BOUND_RESOURCE = "_httk_bound_resource"
+_BOUND_LINKS = "_httk_bound_links"
+_MISSING = object()
+
+
+@functools.cache
+def _bound_class(cls: type) -> type:
+    """Return the cached thin per-backend subclass carrying a ``.links`` accessor.
+
+    Mirrors ``httk.store.backend.mongo.store._bound_record_class``: the
+    subclass keeps the base dataclass's equality, hash, and repr semantics
+    intact (a bound instance and a plain one compare and hash equal) and
+    adds only the hidden store/resource slots :func:`RemoteSearcher._wrap`
+    sets, the ``links`` descriptor, and ``__reduce_ex__`` -- so pickling,
+    copying, or :func:`dataclasses.replace` on a bound instance always
+    produces the plain base class, never one still carrying a live store
+    reference.
+
+    :param cls: The plain backend dataclass to derive a bound subclass from.
+    :return: The cached bound subclass.
+    """
+
+    fields = dataclasses.fields(cls)
+    field_names = tuple(field.name for field in fields)
+    compare_fields = tuple(field for field in fields if field.compare)
+    hash_fields = tuple(field for field in fields if field.hash is True or (field.hash is None and field.compare))
+    repr_fields = tuple(field for field in fields if field.repr)
+    bound_type: type
+
+    def eq(self: Any, other: Any) -> Any:
+        if type(other) is not cls and type(other) is not bound_type:
+            return NotImplemented
+        return tuple(getattr(self, field.name) for field in compare_fields) == tuple(
+            getattr(other, field.name) for field in compare_fields
+        )
+
+    def ne(self: Any, other: Any) -> Any:
+        result = eq(self, other)
+        return NotImplemented if result is NotImplemented else not result
+
+    def bound_hash(self: Any) -> int:
+        return hash(tuple(getattr(self, field.name) for field in hash_fields))
+
+    def bound_repr(self: Any) -> str:
+        values = ", ".join(f"{field.name}={getattr(self, field.name)!r}" for field in repr_fields)
+        return f"{cls.__qualname__}({values})"
+
+    def reduce(self: Any, _protocol: int) -> tuple[type, tuple[Any, ...]]:
+        return (cls, tuple(getattr(self, name) for name in field_names))
+
+    attrs: dict[str, Any] = {
+        "__module__": cls.__module__,
+        "__httk_storage_record__": cls,
+        "__httk_row_base__": cls,
+        "__eq__": eq,
+        "__ne__": ne,
+        "__hash__": bound_hash,
+        "__repr__": bound_repr,
+        "__reduce_ex__": reduce,
+        "links": _RemoteLinksDescriptor(),
+    }
+    bound_type = type(f"{cls.__name__}Remote", (cls,), attrs)
+    return bound_type
+
+
+class _RemoteLinksDescriptor:
+    """The ``links`` non-data descriptor of one bound remote record instance.
+
+    Mirrors ``httk.store.store_common._LinksDescriptor``: it reads the
+    hidden store/resource reference :func:`RemoteSearcher._wrap` sets, then
+    returns a memoized :class:`_RemoteLinksAccessor`. A plain instance, or a
+    bound instance produced by :func:`dataclasses.replace` (which always
+    constructs a fresh instance through the ordinary ``__init__``), carries
+    neither and so simply has no ``links`` attribute.
+    """
+
+    __slots__ = ()
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        try:
+            store = instance.__dict__[_BOUND_STORE]
+            resource = instance.__dict__[_BOUND_RESOURCE]
+        except KeyError:
+            raise AttributeError("links") from None
+        cached = instance.__dict__.get(_BOUND_LINKS, _MISSING)
+        if cached is not _MISSING:
+            return cached
+        accessor = _RemoteLinksAccessor(store, resource)
+        object.__setattr__(instance, _BOUND_LINKS, accessor)
+        return accessor
+
+
+class _RemoteLinksAccessor:
+    """Lazy, per-instance ``.links.<name>`` resolution for one bound record.
+
+    Identifiers are matched against the response's ``included`` array by
+    their own ``(type, id)``, never by the relationship block key *name*
+    itself: some relationships (StrongLink provenance edges) use wire keys
+    that differ from the identifier's own ``type``. A related resource
+    already present in ``included`` -- via an output's automatic ``include=``
+    or a service's own default includes -- is wrapped in place at no extra
+    cost; one absent from ``included`` costs one HTTP request per missing
+    identifier. Each named relationship resolves once and is memoized.
+
+    :param store: Owning store, used for discovery and any lazy fetch.
+    :param resource: The bound record's own source resource.
+    :raises OptimadeClientError: If the store is closed, the relationship or an identifier's entry type is unresolvable, or a lazy fetch does not resolve to exactly one resource.
+    :raises OptimadeResponseError: If ``included`` or a matched member is malformed.
+    """
+
+    __slots__ = ("_cache", "_resource", "_store")
+
+    def __init__(self, store: OptimadeStore, resource: OptimadeResource) -> None:
+        self._store = store
+        self._resource = resource
+        self._cache: dict[str, tuple[object, ...]] = {}
+
+    def __getattr__(self, name: str) -> tuple[object, ...]:
+        if name.startswith("__"):
+            # Unlike a store-declared link name, an OPTIMADE relationship key
+            # routinely carries a single leading underscore (a provider
+            # prefix, e.g. ``_httk_records``) or names a StrongLink wire key
+            # (``_httk_has_input``), so only actual dunder introspection
+            # probes are rejected here.
+            raise AttributeError(name)
+        if name not in self._cache:
+            self._cache[name] = self._resolve(name)
+        return self._cache[name]
+
+    def _resolve(self, name: str) -> tuple[object, ...]:
+        self._store._require_open()
+        resource = self._resource
+        relationships = resource.get("relationships")
+        if not isinstance(relationships, Mapping) or name not in relationships:
+            available = sorted(relationships) if isinstance(relationships, Mapping) else []
+            raise OptimadeClientError(
+                f"resource {resource.id!r} of type {resource.type!r} has no relationship {name!r}; "
+                f"available relationships: {available}"
+            )
+        block = relationships[name]
+        data_raw = block.get("data") if isinstance(block, Mapping) else None
+        if not data_raw:
+            return ()
+        if not isinstance(data_raw, tuple):
+            raise OptimadeResponseError(f"relationship {name!r} data must be an array")
+        data = data_raw
+
+        included_raw = optimade_document_root(resource.document).get("included")
+        if included_raw is None:
+            included: tuple[object, ...] = ()
+        elif isinstance(included_raw, tuple):
+            included = included_raw
+        else:
+            raise OptimadeResponseError("OPTIMADE document 'included' must be an array when present")
+        validated_included = [
+            RemoteSearcher._validate_resource_item(item, index, member="included")
+            for index, item in enumerate(included)
+        ]
+
+        results: list[object] = []
+        for identifier in data:
+            if not isinstance(identifier, Mapping):
+                raise OptimadeResponseError(f"relationship {name!r} identifier must be an object")
+            id_type = identifier.get("type")
+            id_value = identifier.get("id")
+            if not isinstance(id_type, str) or not id_type or not isinstance(id_value, str) or not id_value:
+                raise OptimadeResponseError(
+                    f"relationship {name!r} identifier must have nonempty string 'type' and 'id'"
+                )
+            descriptor = self._store.entry_types_by_name.get(id_type)
+            if descriptor is None:
+                raise OptimadeClientError(f"relationship {name!r} identifier names unknown entry type {id_type!r}")
+            match_index = next(
+                (
+                    index
+                    for index, item in enumerate(validated_included)
+                    if item["type"] == id_type and item["id"] == id_value
+                ),
+                None,
+            )
+            if match_index is not None:
+                included_resource = OptimadeResource(
+                    resource.document, match_index, descriptor.schema, member="included"
+                )
+                results.append(RemoteSearcher._wrap(self._store, descriptor, included_resource))
+                continue
+            # Not included: one lazy fetch per missing identifier.
+            search = self._store.searcher()
+            variable = search.variable(descriptor)
+            search.add(variable.id == id_value)
+            try:
+                row = search.results(item=variable).one()
+            except (NoResultError, MultipleResultsError) as exc:
+                raise OptimadeClientError(
+                    f"related {id_type!r} identifier {id_value!r} did not resolve to exactly one resource"
+                ) from exc
+            results.append(row.item)
+        return tuple(results)
 
 
 class RemoteSearcher:
@@ -492,7 +741,6 @@ class RemoteSearcher:
         self._limit: int | None = None
         self.offset = 0
         self._count_cache = _CountCache()
-        self._includes: tuple[str, ...] = ()
 
     def _clone(self) -> "RemoteSearcher":
         clone = type(self)(self._store, response_fields=self._response_fields_setting)
@@ -506,13 +754,13 @@ class RemoteSearcher:
                     output.name,
                     clone._variable if output.variable is not None else None,
                     clone._fields[cast(_RemoteField, output.field)._local_name] if output.field is not None else None,
+                    output.link,
                 )
                 for output in self._outputs
             ]
         clone._limit = self._limit
         clone.offset = self.offset
         clone._count_cache = self._count_cache
-        clone._includes = self._includes
         return clone
 
     def _invalidate_count(self) -> None:
@@ -524,7 +772,11 @@ class RemoteSearcher:
                 raise _unsupported("a RemoteEntryType from another store or stale discovery snapshot")
             return target
         if isinstance(target, type):
-            matches = tuple(item for item in self._store.entry_types if item.backend is target)
+            # A previously returned bound record's own class (see _bound_class)
+            # names its plain base here, so variable(type(some_result)) resolves
+            # exactly like variable(<the plain backend class>).
+            base = cast(type, getattr(target, "__httk_row_base__", target))
+            matches = tuple(item for item in self._store.entry_types if item.backend is base)
             if len(matches) == 1:
                 return matches[0]
             if not matches:
@@ -633,7 +885,7 @@ class RemoteSearcher:
         ingredients :class:`_RemoteField` needs.
 
         Shared by :meth:`_bind_descriptor` (building a root query variable)
-        and :class:`_RemoteRelated` (building depth-1 relationship fields),
+        and :class:`_RemoteLinkSet` (building depth-1 relationship fields),
         so definition-IRI derivation for a generic vs. a bound descriptor is
         written, and computed, exactly once for both call sites.
 
@@ -709,9 +961,16 @@ class RemoteSearcher:
         self._invalidate_count()
 
     def output(self, variable: object, name: str) -> None:
-        """Declare a whole-record or scalar output.
+        """Declare a whole-record, scalar, or set-valued relationship output.
 
-        :param variable: Root variable or field to project.
+        A relationship namespace (``variable.links.<name>``) is a set-valued
+        output: it yields a tuple of bound related records per row, resolved
+        from the response's ``included`` array or one lazy fetch per missing
+        identifier -- the same resolution a returned record's own
+        ``.links.<name>`` performs. Served-entry-type relationship names are
+        also added to the request's ``include=`` parameter automatically.
+
+        :param variable: Root variable, portable scalar field, or relationship namespace to project.
         :param name: Output name.
         :raises ValueError: If the name is empty or duplicated.
         :raises httk.store.UnsupportedQueryError: If the output belongs elsewhere.
@@ -725,10 +984,15 @@ class RemoteSearcher:
             output = _Output(name, root, None)
         elif isinstance(variable, _RemoteField) and variable._searcher is self:
             if self._fields.get(variable._local_name) is not variable:
-                # A related field (_RemoteRelated.__getattr__) is never a
-                # value of this searcher's own field map -- it is filter-only.
+                # A chained relationship field (_RemoteLinkSet.__getattr__) is
+                # never a value of this searcher's own field map -- it is
+                # filter-only.
                 raise _unsupported("related fields as outputs or sort keys")
             output = _Output(name, None, variable)
+        elif isinstance(variable, _RemoteLinkSet) and variable._searcher is self:
+            if variable._variable is not root:
+                raise _unsupported("link sets from another backend or searcher")
+            output = _Output(name, None, None, variable._name)
         else:
             raise _unsupported("outputs other than the root record or a portable scalar field")
         self._outputs.append(output)
@@ -825,33 +1089,22 @@ class RemoteSearcher:
             raise ValueError("offset must be nonnegative")
         self.offset += offset
 
-    def include(self, *targets: object) -> Self:
-        """Request related resources via the OPTIMADE ``include`` query parameter.
+    def _include_names(self) -> tuple[str, ...]:
+        """Return the ordered, de-duplicated ``include=`` targets implied by outputs.
 
-        Unlike :meth:`add_sort` and :meth:`set_limit`, this returns ``self``
-        rather than ``None``: it is a builder convenience for chaining, not
-        part of the neutral portable-query protocol.
-
-        :param \\*targets: One or more discovered entry types, or their transport endpoint names.
-        :return: This searcher, for chaining.
-        :raises TypeError: If no target is given.
-        :raises httk.store.UnsupportedQueryError: If a name does not match a discovered endpoint.
+        Only relationship outputs naming a served entry type are included:
+        a wire-only relationship key (a StrongLink edge such as
+        ``_httk_has_input``) is never a served entry type and always
+        resolves by lazy per-identifier fetch instead.
         """
-        if not targets:
-            raise TypeError("include() requires at least one target")
-        names: list[str] = []
-        for target in targets:
-            if isinstance(target, RemoteEntryType):
-                name = target.name
-            elif isinstance(target, str):
-                name = target
-            else:
-                raise _unsupported("include targets other than a RemoteEntryType or entry-type name")
-            if name not in self._store.entry_types_by_name:
-                raise _unsupported(f"include of unknown entry type {name!r}")
-            names.append(name)
-        self._includes = tuple(dict.fromkeys((*self._includes, *names)))
-        return self
+
+        return tuple(
+            dict.fromkeys(
+                output.link
+                for output in self._outputs
+                if output.link is not None and output.link in self._store.entry_types_by_name
+            )
+        )
 
     def _filter_text(self) -> str | None:
         if not self._expressions:
@@ -881,8 +1134,10 @@ class RemoteSearcher:
                     ",".join(("-" if descending else "") + field._remote_name for field, descending in self._sorts),
                 )
             )
-        if include_related and self._includes:
-            parameters.append(("include", ",".join(self._includes)))
+        if include_related:
+            include_names = self._include_names()
+            if include_names:
+                parameters.append(("include", ",".join(include_names)))
         parameters.append(("page_limit", str(page_limit)))
         return self._store._transport_base_url + "/" + quote(descriptor.name, safe="") + "?" + urlencode(parameters)
 
@@ -988,9 +1243,9 @@ class RemoteSearcher:
         """Validate one JSON:API resource object from a response envelope array.
 
         Shared by primary ``data`` page validation (``_validate_entry_page``)
-        and included-member validation (``OptimadeStore.related``): both
-        apply the identical envelope-shape checks -- an object with nonempty
-        string ``id``/``type`` and object-valued ``attributes``/``relationships``
+        and included-member validation (``_RemoteLinksAccessor``): both apply
+        the identical envelope-shape checks -- an object with nonempty string
+        ``id``/``type`` and object-valued ``attributes``/``relationships``
         when present -- differing only in whether ``type`` must match one known
         endpoint.
 
@@ -1003,8 +1258,8 @@ class RemoteSearcher:
         """
 
         # Mapping, not dict: primary-page items come from plain json.loads()
-        # dicts, but included-member items (OptimadeStore.related()) come
-        # from the frozen, already-redacted document root, whose objects are
+        # dicts, but included-member items (_RemoteLinksAccessor) come from
+        # the frozen, already-redacted document root, whose objects are
         # immutable MappingProxyType instances rather than dicts.
         if not isinstance(item, Mapping):
             raise OptimadeResponseError(f"OPTIMADE response {member}[{index}] must be an object")
@@ -1026,17 +1281,31 @@ class RemoteSearcher:
         return item
 
     @staticmethod
-    def _wrap(descriptor: RemoteEntryType, resource: OptimadeResource) -> object:
-        """Wrap one resource with its entry type's backend, unless the type is generic.
+    def _wrap(store: OptimadeStore, descriptor: RemoteEntryType, resource: OptimadeResource) -> object:
+        """Wrap one resource with its entry type's backend, bound for ``.links`` access.
 
+        The single construction point for every whole-record result: the
+        returned instance is always of a thin per-backend bound subclass
+        (see :func:`_bound_class`) carrying a hidden store/resource
+        reference, so its ``links`` accessor and any relationship output
+        resolved from it share exactly one resolution path
+        (:class:`_RemoteLinksAccessor`).
+
+        :param store: Owning store, retained for lazy relationship resolution.
         :param descriptor: Entry type descriptor owning the wrapping backend.
         :param resource: Resource to wrap.
-        :return: The bound backend instance, or *resource* itself for a generic (unbound) entry type.
+        :return: The bound backend instance, or a bound generic resource for an unbound entry type.
         """
 
         if descriptor.backend is OptimadeResource:
-            return resource
-        return cast(Callable[[OptimadeResource], object], descriptor.backend)(resource)
+            bound_cls = _bound_class(OptimadeResource)
+            instance = bound_cls(resource.document, resource.data_index, resource.schema, resource.member)
+        else:
+            bound_cls = _bound_class(descriptor.backend)
+            instance = cast(Callable[[OptimadeResource], object], bound_cls)(resource)
+        object.__setattr__(instance, _BOUND_STORE, store)
+        object.__setattr__(instance, _BOUND_RESOURCE, resource)
+        return instance
 
     @staticmethod
     def _log_page_warnings(root: Mapping[str, object]) -> None:
@@ -1115,7 +1384,7 @@ class RemoteSearcher:
                         skipped += 1
                         continue
                     resource = OptimadeResource(document, data_index, descriptor.schema)
-                    yield self._wrap(descriptor, resource), resource
+                    yield self._wrap(self._store, descriptor, resource), resource
                     emitted += 1
                     if effective_limit is not None and emitted >= effective_limit:
                         return
@@ -1137,9 +1406,15 @@ class RemoteSearcher:
         generic = descriptor.backend is OptimadeResource
         names = tuple(output.name for output in self._outputs)
         for value, _resource in self._objects(maximum=maximum, page_limit_override=maximum):
+            # value is always the bound whole-record instance (see _wrap), so
+            # a relationship output resolves through its own .links accessor
+            # even when the record itself is not separately declared as an
+            # output -- exactly one resolution path either way.
             values = tuple(
                 value
                 if output.variable is not None
+                else getattr(cast(Any, value).links, output.link)
+                if output.link is not None
                 else _scalar_value(value, generic, cast(_RemoteField, output.field))
                 for output in self._outputs
             )
@@ -1249,6 +1524,15 @@ class RemoteResultSet:
                     if searcher._fields.get(value._local_name) is not value:
                         raise _unsupported("related fields as outputs or sort keys")
                     self._plan.output(self._plan._fields[value._local_name], name)
+                elif isinstance(value, _RemoteLinkSet) and value._searcher is searcher:
+                    if value._variable is not searcher._variable:
+                        raise _unsupported("link sets from another backend or searcher")
+                    self._plan.output(
+                        _RemoteLinkSet(
+                            self._plan, cast(_RemoteVariable, self._plan._variable), value._name, value._descriptor
+                        ),
+                        name,
+                    )
                 else:
                     raise _unsupported("result projections from another backend or searcher")
         if not self._plan._outputs:
