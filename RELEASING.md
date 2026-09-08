@@ -70,8 +70,8 @@ installation and strict docs build; this is a network check. The resulting
 package files are written to `dist/`.
 
 Versions on package indexes are immutable. Use a new development or release
-candidate version when repeating an upload, for example `0.1.0rc1` followed by
-`0.1.0`.
+candidate version when repeating an upload, for example `2.1.0rc1` followed by
+`2.1.0`.
 
 ## TestPyPI
 
@@ -101,7 +101,7 @@ public package roots to verify the merged wheel.
 
 1. Confirm that `make release-check` succeeds on the exact commit to release.
 2. Push the commit and create a GitHub release whose tag is `v` followed by the
-   package version, for example `v0.1.0`.
+   package version, for example `v2.1.0`.
 3. Publish the GitHub release and approve the protected `pypi` environment.
 4. Verify the release from a fresh environment with `pip install httk-serve`.
 
