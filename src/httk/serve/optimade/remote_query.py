@@ -1466,7 +1466,7 @@ class RemoteSearcher:
         Each terminal indexing operation runs against a fresh searcher minted
         with this searcher's ``response_fields`` policy, so slicer operations
         never share filter state. No sorting is offered here -- use
-        :meth:`OptimadeStore.searcher` and :meth:`add_sort` directly for a
+        :meth:`~httk.serve.optimade.client.OptimadeStore.searcher` and :meth:`add_sort` directly for a
         sorted or relationship query.
 
         :param target: The discovered remote entry endpoint to index.

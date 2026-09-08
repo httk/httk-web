@@ -272,7 +272,7 @@ def bind_operation(
         entries; ``None`` uses each entry callable directly.
     :param scope_names: Request-scope value names available to ``extras``.
     :return: The validated per-request binding.
-    :raises OpenAPIContractError: If the handler cannot satisfy the operation's
+    :raises httk.serve.http.openapi.app.OpenAPIContractError: If the handler cannot satisfy the operation's
         declared inputs by name.
     """
     if isinstance(entry, OperationBinding):

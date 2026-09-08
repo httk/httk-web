@@ -45,7 +45,7 @@ def render(
         property-definition mapping (each carrying ``$id`` and ``description``).
     :param caption: Accessible table caption.
     :return: Static field-definition table and its stylesheet asset.
-    :raises OptimadeTableProtocolError: If ``properties`` is not a non-empty
+    :raises httk.serve.web.widgets.optimade_table.OptimadeTableProtocolError: If ``properties`` is not a non-empty
         mapping of at most 512 identifier-named definition mappings.
     """
     normalized_caption = _text(caption, field="caption", maximum=MAX_OPTIMADE_LABEL_CHARS)
