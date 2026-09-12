@@ -69,6 +69,20 @@ run `make docs-lock-check` for the required full clean-environment locked
 installation and strict docs build; this is a network check. The resulting
 package files are written to `dist/`.
 
+A shared workspace venv can hide missing dependencies. Before tagging, commit
+the intended release files and run the standalone checker from the core
+checkout (no new published core version is needed):
+
+```console
+python ../httk-core/tools/check_release.py . --tag v2.1.0
+```
+
+This checks an exported commit with dev-only CI, a fresh release environment,
+locked docs, and a separate bare-wheel installation. It retains complete logs
+and the verified commit in its report. See the core checkout's
+`tools/README.md` for prerequisites and scope. Browser acceptance remains a
+separate `make test-browser` gate.
+
 Versions on package indexes are immutable. Use a new development or release
 candidate version when repeating an upload, for example `2.1.0rc1` followed by
 `2.1.0`.
@@ -99,7 +113,7 @@ public package roots to verify the merged wheel.
 
 ## PyPI
 
-1. Confirm that `make release-check` succeeds on the exact commit to release.
+1. Confirm that the isolated checker succeeds on the exact source commit to release.
 2. Push the commit and create a GitHub release whose tag is `v` followed by the
    package version, for example `v2.1.0`.
 3. Publish the GitHub release and approve the protected `pypi` environment.
