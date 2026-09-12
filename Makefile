@@ -22,7 +22,7 @@ docs-clean:
 # network); docs builds themselves resolve against these vendored files offline.
 docs-inventories:
 	curl -fsSL https://docs.python.org/3/objects.inv -o docs/_inventories/python.inv
-	curl -fsSL https://www.starlette.io/objects.inv -o docs/_inventories/starlette.inv
+	curl -fsSL https://starlette.dev/objects.inv -o docs/_inventories/starlette.inv
 	# Requires a committed, current docs/requirements.lock; dependency release docs must be published.
 	$(PYTHON) -m httk.core.docs lock-check
 	$(PYTHON) -m httk.core.docs refresh-inventories --base-url $(DOCS_BASE_URL) --channel release .

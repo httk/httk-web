@@ -92,7 +92,7 @@ _docs_base_url = os.environ.get("HTTK_DOCS_BASE_URL", "https://docs.httk.org")
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", "_inventories/python.inv"),
-    "starlette": ("https://www.starlette.io/", "_inventories/starlette.inv"),
+    "starlette": ("https://starlette.dev/", "_inventories/starlette.inv"),
     "httk-core": (f"{_docs_base_url}/httk-core/", "_inventories/httk-core.inv"),
     "httk-store": (f"{_docs_base_url}/httk-store/", "_inventories/httk-store.inv"),
 }
