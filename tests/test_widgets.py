@@ -1,3 +1,4 @@
+from html import unescape
 from pathlib import Path
 
 import pytest
@@ -87,7 +88,7 @@ def test_markdown_fence_closers_require_matching_length_and_whitespace_tail(tmp_
     assert len(rendered_content.widgets) == 1
     assert rendered_content.widgets[0].name == "text"
     assert rendered_content.widgets[0].props == {"text": "after-true-close"}
-    assert "{{ widget(&quot;text&quot;" in output
+    assert '{{ widget("text"' in unescape(output)
     assert "inside" in output
     assert "after-true-close" in output
 

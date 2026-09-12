@@ -64,6 +64,9 @@ where = ["src"]
 
 [project.optional-dependencies]
 dev = [
+  # Store-backed OPTIMADE examples are type-checked and executed by CI.
+  "httk-atomistic>=2.1.0,<3",
+  "httk-store[db]",
   "pytest>=8.0",
   "httpx>=0.27",
   "openapi-spec-validator>=0.7,<0.8",
